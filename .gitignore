@@ -1,0 +1,7 @@
+# Script hand-off state (contains tenant/app/key identifiers)
+cross-tenant-cmk.state.json
+*.state.json
+
+# Local / editor files
+.vscode/
+*.log
