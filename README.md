@@ -10,6 +10,8 @@ The approach follows Microsoft's guidance: [Cross-Tenant Customer-Managed Keys w
 
 No secrets or certificates are exchanged between tenants.
 
+For a **fresh Hyperscale database-level setup using customer-owned Managed HSM**, see the [Managed HSM runbook](./Hyperscale-Cross-Tenant-Managed-HSM-Fresh-Setup.md). It includes portal steps and optional step-by-step Bash/Azure CLI and Azure PowerShell commands, with each operator working only in their own tenant and **no guest-user access in either direction**. The existing PowerShell automation below targets the Key Vault workflow; it is not the Managed HSM deployment script.
+
 ```mermaid
 flowchart LR
     subgraph ISV["Service-provider (ISV) tenant"]
@@ -26,6 +28,7 @@ flowchart LR
 
 | File | Description |
 |---|---|
+| [Hyperscale-Cross-Tenant-Managed-HSM-Fresh-Setup.md](./Hyperscale-Cross-Tenant-Managed-HSM-Fresh-Setup.md) | Fresh Hyperscale database-level CMK setup with Managed HSM, tenant-separated portal steps, Bash and PowerShell alternatives, verification, and operations. |
 | [Set-CrossTenantCmkTde.ps1](./Set-CrossTenantCmkTde.ps1) | Script that configures the ISV and customer sides and applies the TDE protector at **server** or **database** level. |
 | [Cross-Tenant-CMK-TDE-Guide.md](./Cross-Tenant-CMK-TDE-Guide.md) | Step-by-step guide. Marks which steps are done in the **portal** and which by the **script**, and includes verification and troubleshooting. |
 | [Cross-Tenant-CMK-Access-Summary.md](./Cross-Tenant-CMK-Access-Summary.md) | Entra ID roles, Azure RBAC roles and app configuration needed in each tenant, and **why**. |
