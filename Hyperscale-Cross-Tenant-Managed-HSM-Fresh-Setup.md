@@ -1,10 +1,13 @@
 # Fresh setup: Azure SQL Hyperscale database-level CMK across tenants with Managed HSM
 
 Documentation checked: **18 November 2026**.
+Private SQL connectivity guidance checked: **27 November 2026**.
 
 ## 1. Outcome and non-negotiable tenant boundaries
 
 This runbook creates a **new Hyperscale database** in an ISV tenant and protects its database encryption key with a customer-managed key in **Azure Key Vault Managed HSM in the customer's tenant**. It uses **database-level**, not server-level, transparent data encryption (TDE) key management.
+
+**Resource placement is not reversed:** the SQL logical server, Hyperscale database, managed identity, and multitenant app belong to the **ISV tenant/subscription**. Managed HSM and the customer-local enterprise application belong to the **customer tenant/subscription**. SQL client access can use an **ISV-owned private endpoint** without moving SQL into the customer's subscription. The customer retains control of the HSM key lifecycle.
 
 - The ISV operator signs in **only to the ISV tenant**.
 - The customer operator signs in **only to the customer tenant**.
@@ -32,6 +35,25 @@ ISV human: ISV tenant only                  Customer human: customer tenant only
 ```
 
 The customer grants the **customer-tenant service principal** access to one HSM key, not to the ISV user's account or to the ISV managed identity's object ID.
+
+### Private SQL access and TDE key access are separate paths
+
+```text
+ISV application / approved SQL client
+  -> ISV VNet / SQL private endpoint
+  -> ISV logical SQL server / Hyperscale database
+
+Azure SQL managed TDE service in ISV deployment
+  -> customer HSM trusted-service access
+  -> customer-owned Managed HSM key
+```
+
+- A SQL private endpoint provides **inbound SQL client connectivity**. It does not inject the Hyperscale service into the endpoint VNet or supply an outbound route for TDE key operations.
+- With the customer HSM's **trusted Microsoft services bypass** enabled as in step 5, **no ISV-to-customer VNet peering, VPN, or ExpressRoute is required for TDE key access**. Federation and HSM-local key permissions remain mandatory.
+- The SQL client must reach the **ISV SQL private endpoint** and resolve the server name through the correct private DNS path. Any network connection needed by a client outside that VNet is a client-access requirement, not an HSM encryption requirement.
+- If the customer uses an HSM private endpoint for administration, their administrator needs reachability and DNS for that **customer-owned** endpoint; the ISV SQL-client VNet does not need connectivity to it just for TDE.
+- HSM public network access **Disabled** does not suppress its trusted-service bypass, according to Microsoft documentation. Consequently, this setting with bypass enabled is **not** a guarantee that every HSM request traverses a private endpoint.
+- If policy requires **HSM private-endpoint-only access with trusted-service bypass disabled**, obtain a separately validated Azure SQL TDE connectivity design. Peering the two VNets does not, by itself, make the managed TDE service use the customer's private endpoint.
 
 **Security boundary:** TDE protects data at rest; it does not prevent an authorized SQL administrator/application from reading data through SQL. The ISV controls the application's credentials and federation configuration, so the customer is trusting that application, not cryptographically restricting it to one SQL database. Use a dedicated application and managed identity per customer/isolation boundary; govern app ownership and changes in the ISV tenant. Do not put unrelated credentials or federated identities on this application.
 
@@ -77,6 +99,7 @@ Different people within a party can perform these duties. An HSM Administrator c
 6. Customer: obtain an approved **public IPv4 egress address/CIDR** for the machine doing activation/key administration. The HSM firewall must allow it. Portal key operations also originate from the operator's network; Cloud Shell has a different egress and is **not automatically allowed** by trusted-services bypass.
 7. Customer: plan security-domain custody: at least three RSA wrapping certificate/key pairs and a recovery quorum (example: **2 of 3**). Prepare these under customer control, preferably offline with separate custodians. Private keys never go to Azure or the ISV.
 8. Use public Azure endpoints in this runbook. Sovereign clouds require their own endpoints and compatibility checks.
+9. For private SQL client access, follow step 9A. Use an approved ISV VNet/subnet and private DNS design, or create a new ISV VNet/subnet under the network team's approved address plan. Register `Microsoft.Network` in the ISV subscription. The ISV network operator needs endpoint/subnet and private DNS permissions at those local scopes; no customer network role is needed for TDE.
 
 ### Values to agree on
 
@@ -88,6 +111,7 @@ Different people within a party can perform these duties. An HSM Administrator c
 | Customer resource group | Customer | `rg-customer-mhsm-new` |
 | Region | Each | `eastus`, or an approved supported region |
 | SQL server / database | ISV | Globally unique server / `hs-customer-a` |
+| SQL private endpoint / VNet / subnet / private DNS | ISV | Required only for private SQL client access; DNS zone `privatelink.database.windows.net` |
 | Managed identity / app | ISV | `mi-hs-customer-a` / `app-hs-cmk-customer-a` |
 | SQL Entra admin name and object ID | ISV | ISV-native user; **not** the UAMI or customer user |
 | HSM name / key name | Customer | Globally unique HSM / `sql-tde-customer-a` |
@@ -445,6 +469,8 @@ This route grants delegated access to a signed-in user's basic profile; it does 
 
 **Network design in this runbook:** restricted public HSM endpoint plus the trusted Azure SQL service bypass. This does not grant authorization; HSM-local role assignment is still required. Do not broadly allow all IP addresses. A private endpoint is not a drop-in replacement that automatically routes Azure SQL's managed TDE service through a customer VNet. Private-only designs need a separately validated SQL/HSM connectivity design; do not disable the working service path as an untested hardening step.
 
+This customer HSM configuration also supports the ISV SQL **private-endpoint** option in step 9A: the SQL inbound access setting is independent of the managed TDE service's HSM access. Do not add cross-tenant VNet peering or allowlist the SQL private endpoint's private IP address on the HSM firewall for this purpose.
+
 ### Bash
 
 ```bash
@@ -679,10 +705,12 @@ Resume the ISV's original shell or browser profile. The customer does not perfor
 2. Under **Server > Create new**, enter the unique server name and region.
 3. Choose **Microsoft Entra-only authentication**, set the approved **ISV-native user** as administrator, and save the server selection.
 4. Continue creating the database in step 10. If creating the logical server separately, finish that resource first.
-5. For this example use a public SQL endpoint with **only the approved ISV SQL client IPv4 firewall rule**. Keep **Allow Azure services and resources to access this server = No**. Production private SQL connectivity is an independent network design.
+5. Choose a client network path: the basic example uses a public SQL endpoint with **only the approved ISV SQL client IPv4 firewall rule**. Keep **Allow Azure services and resources to access this server = No**. For private SQL access, follow step 9A instead and omit the public client firewall rule.
 6. Leave **server-level** TDE key management as **Service-managed**. The server does not need the customer's federated identity or key.
 
-### Bash - create server and a narrow client firewall rule
+### Bash - create server and a narrow client firewall rule (public-client option)
+
+For the private-client option, run only `az sql server create` below, omit `az sql server firewall-rule create`, and complete step 9A.
 
 ```bash
 assert_context "$ISV_TENANT_ID" "$ISV_SUBSCRIPTION_ID"
@@ -697,6 +725,8 @@ az sql server firewall-rule create --resource-group "$ISV_RG" --server "$SQL_SER
 
 ### PowerShell
 
+For the private-client option, run only `New-AzSqlServer` below, omit `New-AzSqlServerFirewallRule`, and complete step 9A.
+
 ```powershell
 Assert-AzureContext $IsvTenantId $IsvSubscriptionId
 New-AzSqlServer -ResourceGroupName $IsvRg -ServerName $SqlServer -Location $Location `
@@ -710,6 +740,52 @@ New-AzSqlServerFirewallRule -ResourceGroupName $IsvRg -ServerName $SqlServer `
 
 **Checkpoint:** new server exists in the ISV tenant; SQL administrator is an ISV-native user; server protector is still service-managed. No SQL administrator password is needed in this example.
 
+### Step 9A - Optional private SQL endpoint in the ISV subscription
+
+These networking steps change **logical-server** client access and therefore affect all databases on that server, even though the CMK remains database-level. Use the new dedicated server from step 9.
+
+**ISV portal configuration**
+
+1. If necessary, create **Virtual networks > Create** in the ISV subscription using the approved, nonoverlapping address space and subnet. Otherwise use the approved existing ISV VNet/subnet. Never modify a shared network's address plan just for this example.
+2. Open the ISV **SQL logical server > Networking > Private access > Create a private endpoint**.
+3. Choose the **ISV subscription**, approved resource group, endpoint name, and the region of the endpoint VNet.
+4. Target the ISV logical server resource (`Microsoft.Sql/servers`), subresource **`sqlServer`**. The target is the logical server, not a database resource or the customer HSM.
+5. Select the ISV VNet and subnet. Keep the ISV application/client network routing and subnet policies consistent with the approved design.
+6. Enable private DNS integration with **`privatelink.database.windows.net`**. Create the zone if absent, or reuse the network team's existing zone. Link it to the client VNet; if using custom DNS, configure forwarding/resolution through the approved DNS infrastructure. Avoid duplicate conflicting zones.
+7. Create the endpoint. Under SQL **Private access**, verify that its connection is **Approved**. The ISV resource owner approves it if approval was not automatic; no customer-tenant user is involved.
+8. Inspect the endpoint NIC's private IP and verify that DNS has the corresponding server record.
+9. Configure SQL **Connection policy** explicitly: prefer **Redirect** only when client/network rules permit the documented required TCP flows (1433-65535 for private-endpoint Redirect). Otherwise choose **Proxy**, which uses TCP 1433 with a performance tradeoff. Do not assume the default policy meets the private-endpoint design.
+10. Under SQL **Networking > Public access**, set **Public network access = Disabled** and save. Creating a private endpoint alone does **not** disable public access. This step can disconnect public clients; perform it only after private networking is ready.
+11. Complete database creation in step 10. After the database exists, perform the private client checks below and the TDE checks in step 11.
+
+**Optional commands for step 10 above, after endpoint/DNS/policy configuration**
+
+Run one alternative in the initialized **ISV** shell. The customer HSM network settings remain unchanged.
+
+```bash
+assert_context "$ISV_TENANT_ID" "$ISV_SUBSCRIPTION_ID"
+az sql server update --resource-group "$ISV_RG" --name "$SQL_SERVER" \
+  --enable-public-network false --output none
+[[ "$(az sql server show -g "$ISV_RG" -n "$SQL_SERVER" --query publicNetworkAccess -o tsv)" == "Disabled" ]]
+```
+
+```powershell
+Assert-AzureContext $IsvTenantId $IsvSubscriptionId
+Set-AzSqlServer -ResourceGroupName $IsvRg -ServerName $SqlServer `
+    -PublicNetworkAccess Disabled | Out-Null
+if ((Get-AzSqlServer -ResourceGroupName $IsvRg -ServerName $SqlServer).PublicNetworkAccess -ne 'Disabled') {
+    throw 'SQL public network access is not disabled.'
+}
+```
+
+**Private-client acceptance checks**
+
+- From the approved ISV client network, resolve **`<server-name>.database.windows.net`** and confirm the final address equals the SQL private endpoint NIC IP. On Windows, use `Resolve-DnsName` and `Test-NetConnection -ComputerName <server-name>.database.windows.net -Port 1433`. A successful TCP test alone is not sufficient.
+- Connect using **`<server-name>.database.windows.net`**, the Hyperscale database name, and Entra authentication. Do not use the private IP or `<server-name>.privatelink.database.windows.net` as the SQL connection-string server.
+- Run the SQL verification query in step 11; verify the persisted customer HSM protector and database identity using that step's ARM checks.
+- Confirm SQL public network access remains Disabled and customer HSM trusted-service access remains configured. Public SQL firewall rules do not govern private-endpoint connections; retain network controls and SQL authentication/permissions.
+- Cloud Shell or the operator's laptop will not automatically reach this private endpoint. Use a client in the ISV VNet or with approved routing/DNS to it. ARM management commands can still run without a SQL data-plane connection.
+
 ## 13. Step 10 - ISV creates the Hyperscale database with database-level cross-tenant CMK
 
 Do not create a temporary service-managed database first: these examples assign the database identity and customer protector **during database creation**.
@@ -721,7 +797,7 @@ Do not create a temporary service-managed database first: these examples assign 
    - Service tier: **Hyperscale**.
    - Hardware: **Standard-series (Gen5)**, provisioned **2 vCores**, if available/approved.
    - Review replica count and costs. Example backup storage redundancy: **Locally redundant**; choose the production-approved redundancy instead when required.
-3. **Networking**: follow the narrow client-access settings from step 9.
+3. **Networking**: follow the narrow public-client settings from step 9, or the private-client configuration in step 9A. Do not re-enable public access when using step 9A.
 4. **Security > Transparent data encryption key management > Database level key > Configure transparent data encryption**.
 5. Select **Database level customer managed key (CMK)**.
 6. Under **User-assigned managed identity > Configure**, enable **Database identity**, add the ISV UAMI from step 1, and apply.
@@ -954,6 +1030,7 @@ If enabling automatic rotation later, coordinate HSM key-version creation/rotati
 - [ ] HSM key is enabled AES-256 (`oct-HSM`) with valid dates and wrap/unwrap operations.
 - [ ] Runtime principal has only the required key-level HSM-local service-encryption role.
 - [ ] Restricted administration network plus Azure SQL trusted-service path verified.
+- [ ] If private SQL access is selected: endpoint approved in the ISV subscription, client DNS/routes verified, connection policy configured, and SQL public access disabled. No cross-tenant VNet connection added merely for TDE.
 - [ ] New database is Online, Hyperscale, TDE Enabled, with the expected versioned HSM URI.
 - [ ] Database UAMI and federated client ID match; auto-rotation is initially disabled.
 - [ ] Logical server protector remains service-managed.
@@ -978,3 +1055,4 @@ These links are external Microsoft documentation; review current service and reg
 12. [Azure CLI SQL database command reference](https://learn.microsoft.com/en-us/cli/azure/sql/db?view=azure-cli-latest).
 13. [PowerShell key-generation reference](https://learn.microsoft.com/en-us/powershell/module/az.keyvault/add-azkeyvaultkey).
 14. [Microsoft identity platform admin-consent protocol](https://learn.microsoft.com/en-us/entra/identity-platform/v2-admin-consent).
+15. [Azure SQL private endpoints, DNS, public access, and connection policies](https://learn.microsoft.com/en-us/azure/azure-sql/database/private-endpoint-overview?view=azuresql).
